@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"gopkg.in/yaml.v2"
 	"io"
 	"os"
 	"os/exec"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"gopkg.in/yaml.v2"
 
 	"golang.org/x/net/context"
 )
@@ -196,10 +197,26 @@ func (p *lxdProvider) Allocate(ctx context.Context, system *System) (Server, err
 		}
 	}
 
-	err = p.tuneSSH(name)
-	if err != nil {
-		s.Discard(ctx)
-		return nil, err
+	printf("Waiting for LXD VM agent in instance %s to prepare sshd...", name)
+	timeout = time.After(60 * time.Second)
+	retry = time.NewTicker(1 * time.Second)
+	defer retry.Stop()
+	for {
+		err = p.tuneSSH(name)
+		if err == nil {
+			break
+		}
+		if _, ok := err.(*lxdAgentNotAvailableError); !ok {
+			s.Discard(ctx)
+			return nil, err
+		}
+
+		select {
+		case <-retry.C:
+		case <-timeout:
+			s.Discard(ctx)
+			return nil, err
+		}
 	}
 
 	printf("Allocated %s.", s)
@@ -621,8 +638,13 @@ func (p *lxdProvider) tuneSSH(name string) error {
 	}
 	for _, args := range cmds {
 		output, err := exec.Command("lxc", append([]string{"exec", name, "--"}, args...)...).CombinedOutput()
-		if err != nil && args[0] != "killall" {
-			return fmt.Errorf("cannot prepare sshd in lxd container %q: %v", name, outputErr(output, err))
+		if err != nil {
+			if bytes.HasPrefix(output, []byte("Error: LXD VM agent is not currently running")) {
+				return &lxdAgentNotAvailableError{name}
+			}
+			if args[0] != "killall" {
+				return fmt.Errorf("cannot prepare sshd in lxd container %q: %v", name, outputErr(output, err))
+			}
 		}
 	}
 	return nil
